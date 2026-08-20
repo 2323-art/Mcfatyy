@@ -48,7 +48,14 @@ After refreshing the file, update its verification date and any affected snapsho
 - Treat every client action as untrusted. The server owns progression, currency, food inventory, rewards, RNG, upgrades, rebirths, and persistence.
 - Keep public contracts narrow and typed. Do not silently change remote payloads or save data.
 - Use focused MCP edits and re-read changed scripts afterward to confirm the applied source.
-- Do not publish, save a new place version, enable production DataStore access in Studio, import assets, or destructively rebuild world content unless that action is explicitly in scope.
+- Do not publish, enable production DataStore access in Studio, import assets, or destructively rebuild world content unless that action is explicitly in scope.
+
+## Saving during implementation
+
+- Use Studio's **Save to Roblox** option regularly while implementing changes in the selected McFatty place. This standing authorization applies to saving the current place, but not to publishing it.
+- Save after each meaningful, internally consistent implementation checkpoint, before a risky or broad follow-up edit, and once more after verification succeeds and before handoff.
+- Do not intentionally save a known broken or syntactically invalid checkpoint. If a save fails, report the failure and continue only when the unsaved state and recovery risk are understood.
+- Never use **Save to Roblox As**, overwrite another place, or change the target place ID unless the user explicitly requests it.
 
 ## Verification rules
 

@@ -45,9 +45,9 @@ Player input
 Ownership rules:
 
 - **Server:** live player state, Calories, weight, tray contents, upgrades, RNG, bag rolls, rewards, rebirth eligibility, persistence, milestone detection, character size application, and station prompt validation.
-- **Shared:** pure economy rules, balance/config data, progression data, and number formatting. Shared economy code touches no Roblox services and is reused by tests/simulation.
-- **Client:** input, local presentation, smooth Calories prediction between authoritative syncs, UI construction, drag/drop, client-only plated-food progress, camera framing, sounds, and effects.
-- **Workspace/builders:** baked restaurant and station geometry. Builders recreate content only when explicitly called; server boot creates stations only if `Workspace.Stations` is missing.
+- **Shared:** pure economy rules, exact action-shape validation, the deterministic meal state machine, balance/config data, progression data, and number formatting.
+- **Client:** input, local presentation, smooth Calories prediction between authoritative syncs, UI construction, drag/drop, local bite animation for a server-reserved meal, collection-board rendering, camera framing, sounds, and effects.
+- **Workspace/builders:** baked restaurant and station geometry. Destructive full rebuilds remain explicit; additive boot migrations create only missing TODO-era world pieces.
 
 The client never sends resulting currency, weight, tiers, rolls, or upgrade levels. It sends only named intent plus minimal identifiers or indices.
 
@@ -61,11 +61,11 @@ The client never sends resulting currency, weight, tiers, rolls, or upgrade leve
 2. Ensures three `RemoteEvent` instances exist: `Action`, `Sync`, and `Notify`.
 3. Runs `Balance.validate()` and refuses to start if an economy invariant fails.
 4. Resolves whether DataStore persistence is available and warns when Studio uses memory fallback.
-5. Starts `PlayerService` and `CharacterService`.
-6. Builds `Workspace.Stations` from `ServerStorage.StationsBuilder` only if it is absent.
-7. Starts `StationService`.
+5. Runs additive `MapBuilder.ensureTodoWorld()` and `StationsBuilder.ensureTodoStations()` migrations. They add missing Drive-Thru/leaderboard/scale pieces without destroying existing roots.
+6. Starts `PlayerService` and `CharacterService`.
+7. Starts `StationService` and `LeaderboardService`.
 
-`Workspace.Restaurant` is already baked. `MapBuilder` is not called on normal boot.
+`Workspace.Restaurant` is already baked. The destructive `MapBuilder.build()` path is not called on normal boot.
 
 ### Player join
 
@@ -102,16 +102,18 @@ All three remotes are created at runtime by the server entry point. In Edit mode
 | Action | Arguments | Server behavior |
 |---|---|---|
 | `BuyBag` | `bagId: string` | Validate unlock, room, and Calories; server rolls one item; then auto-merge. |
-| `FillTray` | `bagId: string` | Repeatedly buy while legal, running auto-merge between purchases. |
+| `FillTray` | `bagId: string` | Buy while legal, running auto-merge between purchases, with a hard maximum of `512` purchases per request. |
 | `BuyUpgrade` | `id: string` | Validate known upgrade, level cap, and cost. |
 | `ToggleAutoMerge` | none | Flip the saved toggle and merge eligible full groups when enabled. |
 | `Merge` | `slotA: number, slotB: number` | Validate two occupied, distinct, matching slots and merge result. |
-| `Eat` | `tier: number` | Eat one owned item of that tier; tier is used because slot indices can move during multi-bite eating. |
+| `BeginEat` | `tier: number` | Reserve one owned tier and return deterministic bite count/duration; food remains owned. |
+| `CompleteEat` | none | Consume the reserved tier only after its server ready time. Early, replayed, or stale completion cancels without reward. |
+| `CancelEat` | none | Clear the active reservation without consuming food. |
 | `OpenPending` | `bagId: string` | Open one owed bag for free if the tray has room; server rolls it. |
 | `Rebirth` | none | Validate `kg >= 10,000`, then reset the run. |
 | `Debug` | `what: string, value: number` | Studio-only: `setKg` or `addCalories`; rejected outside Studio. |
 
-The server uses a token-bucket limit of `25` actions per second per loaded session. Unknown, malformed, unloaded, or over-budget requests are ignored or rejected. Economy functions re-check their own preconditions.
+Every action first passes `Shared.ActionSpec`: exact argument count, bounded known IDs, finite integer slots/tiers, and Studio-only bounded debug values. Legacy one-shot `Eat` is rejected. The server uses a token bucket of `25` units per second; `FillTray` costs `5` units and has a `0.25` second cooldown. Economy functions re-check state preconditions.
 
 ### `Sync`: server to client
 
@@ -125,6 +127,7 @@ Authoritative snapshot fields:
 - `eatBites`, `sizeStage`, `multiplier`
 - `canRebirth`, `nextMilestone`
 - `pendingBags`
+- `discoveredFoods` (cloned map keyed by stable `tier_N` food IDs)
 
 Do not remove or rename these without updating every client consumer and this document.
 
@@ -139,6 +142,9 @@ Do not remove or rename these without updating every client consumer and this do
 | `Daily` | `{ streak, bagId, count, day }` | Daily reward modal. |
 | `Station` | station ID | Open/nudge the matching UI destination. |
 | `Jackpot` | rolled tier number | Gold world burst and floating jackpot text. |
+| `Meal` | `{ status, tier?, bites?, duration?, gained?, kg?, reason? }` | Start, complete, or cancel the client plate/hold presentation. |
+| `Discovery` | `{ tier, id }` | Reveal and celebrate the collection cell. |
+| `Rejected` | `{ action, reason }` | Explicit feedback for a well-shaped action that fails state validation. |
 
 ### Mirrored `Player` attributes
 
@@ -149,6 +155,7 @@ For read-only visibility outside the server VM:
 - `Diets`
 - `CalPerSec`
 - `SizeStage`
+- `ProfileLoaded`
 
 `Sync` remains the real client state channel.
 
@@ -167,7 +174,7 @@ Economy state fields:
 
 | Field | Meaning/lifecycle |
 |---|---|
-| `version` | Schema version, currently `1`. |
+| `version` | Schema version, currently `2`. |
 | `peakKg` | Highest lifetime weight; permanent source for milestone rewards and bag unlocks. |
 | `diets` | Completed New Diet count; permanent. |
 | `lifetimeKg` | Total weight gained; permanent and shown on the record board. |
@@ -182,11 +189,12 @@ Economy state fields:
 | `upgrades` | Map of upgrade ID to level; permanent. |
 | `autoMergeEnabled` | Saved toggle; defaults true. |
 | `pendingBags` | Map of bag ID to owed count from offline/daily rewards. |
+| `discoveredFoods` | Permanent map of known stable `tier_N` food IDs to `true`; awarded only by a successful eat and preserved by New Diet. |
 | `lastSeen` | Unix time for offline calculation. |
 | `streak` | Daily streak length. |
 | `lastClaimDay` | Integer UTC-like day bucket (`time // 86400`). |
 
-Migration is additive: fields missing from an older save are copied from a fresh default state, then `version` is set to the current version.
+Migration is additive: fields missing from an older save are copied from a fresh default state. Discovery keys are sanitized against the current food ladder before `version` is set to the current version.
 
 Studio persistence behavior:
 
@@ -199,6 +207,7 @@ Studio persistence behavior:
 ### Starting state and income
 
 - Starting weight: `60 kg`.
+- Starting Calories: `300`.
 - Base tray slots: `6`.
 - Starting tray: `{ 1, 1, 1, 2 }`, intentionally containing one full merge group.
 - Base recovery income: `15 Cal/s`.
@@ -389,6 +398,7 @@ The room constant is `140` studs and is mirrored in `Shared.Config.Stations`; ch
 - `Booth`: benches, table, table tray, invisible `DropZone`, and `SeatAnchor`;
 - `Lights`: nine neon panels with point lights;
 - `BoothSpawn`: spawn positioned clear of the booth and facing it.
+- `DriveThruArea`: Diet 1-gated asphalt lane, fences, signs, and a collection/server-top-five purpose area inside the existing room.
 
 The physical booth tray mirrors owned food client-side. `DropZone` is the raycast target that makes drag-to-eat usable even when the thin tray is hard to see.
 
@@ -403,22 +413,23 @@ The physical booth tray mirrors owned food client-side. `DropZone` is the raycas
 | `nutritionist` | Left-wall NPC and scale | Rebirth nudge/action |
 | `drivethru` | Right-wall NPC and pickup window | Daily/pending-bag nudge |
 
-`RecordBoard` shows the local player's `lifetimeKg` through a SurfaceGui.
+`RecordBoard` shows the local player's `lifetimeKg` through a SurfaceGui. `ScaleDial.ScaleDisplay` shows current weight locally. `SizeLeaderboard` shows a server-local, sanitized, deterministic top five of loaded players and coalesces writes to at most once per two seconds.
 
 The left navigation rail remains available even though world stations exist, because very large/anchored players cannot reliably walk to them.
 
 ### UI and input
 
-The client creates `McFattyUI` under `PlayerGui`; `StarterGui` itself is empty. The UI is authored around `1280x720` and globally scales down to a minimum `0.55`.
+The client creates `McFattyUI` under `PlayerGui`; `StarterGui` itself is empty. The UI is authored around `1280x720`, uses a `0.72` narrow-screen floor, changes the tray to five columns on narrow screens, and lifts the tray above the mobile safe area.
 
 Primary UI:
 
-- top HUD pills for weight, Cal/s, Calories, and rebirths;
+- three top HUD groups: weight/size stage, Calories/rate/digestion, and Diets;
+- a slim next-bag unlock marker;
 - visible next-milestone progress card;
-- bottom tray grid with one Auto-Merge button;
+- bottom tray grid with persistent Fill Tray and Auto-Merge actions;
 - right-side mutually exclusive bag shop and upgrades panel;
 - left navigation rail for Shop, Upgrades, Rebirth, and Daily;
-- always-visible bottom-right New Diet progress card;
+- compact early-run New Diet goal that expands from `3,500 kg`;
 - conditional free-bag panel;
 - first-run four-step tutorial;
 - queued toasts and modal panels for daily, offline, milestones, and rebirth.
@@ -428,7 +439,7 @@ Tray controls:
 - bare click on food does nothing;
 - hold and drag a tile onto a matching tile to merge;
 - drag a tile outside the UI onto the booth tray/drop zone to plate it;
-- click the tracked screen-space Eat button once per remaining bite;
+- hold the tracked screen-space Eat button; local bites animate at `4/s`;
 - release always ends the drag; no sticky cursor mode;
 - a max-tier match is refused with explicit feedback;
 - merge results are never predicted client-side.
@@ -436,13 +447,16 @@ Tray controls:
 `TableFood` creates client-only pooled blocks under `Workspace.TableFood`:
 
 - mirror blocks show owned tray food on the table;
-- one plate block represents the currently plated tier;
+- one plate block represents the currently server-reserved tier;
 - tracked, screen-clamped widgets keep Bite and Drop Here reachable at any camera angle;
-- plated state is cleared if that tier disappears from the authoritative tray.
+- the item stays in the authoritative tray until a timely `CompleteEat`;
+- the plate clears only after the completion notification and confirming authoritative snapshot, or on cancellation/respawn/stale ownership.
+
+`CollectionBoard` replaces the physical menu board locally per player. Undiscovered foods render as grey `???` cells; successful eating reveals the icon/name using persisted `tier_N` IDs.
 
 ### Camera, audio, and effects
 
-- Camera distance is derived from the character bounding box and periodically rechecked. The minimum zoom is raised so the camera cannot sit inside a huge character.
+- Camera distance is piecewise from a `12.5`-stud starter distance, grows with the actual character bounds, adds a narrow-screen buffer, and caps required minimum zoom at `55`.
 - UI sounds use engine-built-in assets and a small reusable pool.
 - Merge cascades rise in pitch.
 - World effects scale with character size and clean themselves through Debris.
@@ -452,15 +466,17 @@ Tray controls:
 
 These paths and counts were observed through MCP on the verification date. Differences are a signal to inspect and update this context; do not blindly force Studio back to these counts.
 
+The counts below describe the Edit DataModel after script additions. The additive Drive-Thru, scale-display, and leaderboard instances are created by boot migration in older baked places and therefore appear in Play even when they are not yet baked into the Edit hierarchy.
+
 ### Root counts
 
 | Root | Direct children | Descendants |
 |---|---:|---:|
 | `Workspace` | 4 | 163 |
-| `ReplicatedStorage` | 2 | 11 |
-| `ServerScriptService` | 1 | 7 |
+| `ReplicatedStorage` | 2 | 13 |
+| `ServerScriptService` | 1 | 8 |
 | `ServerStorage` | 4 | 4 |
-| `StarterPlayer` | 2 | 20 |
+| `StarterPlayer` | 2 | 21 |
 | `StarterGui` | 0 | 0 |
 | `StarterPack` | 0 | 0 |
 | `Lighting` | 5 | 5 |
@@ -480,6 +496,8 @@ ReplicatedStorage
 ├── Shared
 │   ├── Economy
 │   ├── Format
+│   ├── ActionSpec
+│   ├── Meal
 │   └── Config
 │       ├── Food
 │       ├── Bags
@@ -496,7 +514,8 @@ ServerScriptService
         ├── DataService
         ├── PlayerService
         ├── CharacterService
-        └── StationService
+        ├── StationService
+        └── LeaderboardService
 
 ServerStorage
 ├── PacingSim
@@ -511,6 +530,7 @@ StarterPlayer
 │       ├── CameraController
 │       ├── WorldEffects
 │       ├── TableFood
+│       ├── CollectionBoard
 │       └── UI
 │           ├── Theme
 │           ├── Tray
@@ -533,6 +553,8 @@ Shared:
 
 - `game.ReplicatedStorage.Shared.Economy` — pure authoritative rules and state mutations.
 - `game.ReplicatedStorage.Shared.Format` — display-only number, weight, rate, and duration formatting.
+- `game.ReplicatedStorage.Shared.ActionSpec` — exact, bounded remote action-shape validation plus action token cost/cooldown.
+- `game.ReplicatedStorage.Shared.Meal` — deterministic begin/complete reservation state machine for server-timed eating.
 - `game.ReplicatedStorage.Shared.Config.Food` — generated food ladder and merge shape.
 - `game.ReplicatedStorage.Shared.Config.Bags` — bag prices, unlocks, drops, EV, and server RNG roll.
 - `game.ReplicatedStorage.Shared.Config.Progression` — milestones, size stages, permanent derived rewards.
@@ -547,13 +569,14 @@ Server:
 - `game.ServerScriptService.Server.Services.PlayerService` — session ownership, actions, accrual, sync, autosave, progress events.
 - `game.ServerScriptService.Server.Services.CharacterService` — stage-to-character rendering and movement lock.
 - `game.ServerScriptService.Server.Services.StationService` — validated ProximityPrompt to client station notification.
+- `game.ServerScriptService.Server.Services.LeaderboardService` — server-local loaded-player top-five board with sanitized labels and coalesced refresh.
 
 ServerStorage tools:
 
 - `game.ServerStorage.PacingSim` — headless engaged/casual pacing model using shipped economy rules.
 - `game.ServerStorage.EconomyTests` — fresh-clone headless regression checks.
-- `game.ServerStorage.MapBuilder` — destructive restaurant rebuild tool.
-- `game.ServerStorage.StationsBuilder` — destructive station rebuild tool; used at boot only if stations are missing.
+- `game.ServerStorage.MapBuilder` — destructive restaurant rebuild tool plus additive TODO-world migration.
+- `game.ServerStorage.StationsBuilder` — destructive station rebuild tool plus additive prompt/scale/leaderboard migration.
 
 Client:
 
@@ -561,6 +584,7 @@ Client:
 - `game.StarterPlayer.StarterPlayerScripts.Client.CameraController` — camera framing for growing characters.
 - `game.StarterPlayer.StarterPlayerScripts.Client.WorldEffects` — character/world particle and ring effects.
 - `game.StarterPlayer.StarterPlayerScripts.Client.TableFood` — table mirror, plate, bite tracking, drag-to-world target.
+- `game.StarterPlayer.StarterPlayerScripts.Client.CollectionBoard` — per-player menu collection, scale display, and Diet-gate presentation.
 - `game.StarterPlayer.StarterPlayerScripts.Client.UI.Theme` — visual tokens and widget constructors.
 - `game.StarterPlayer.StarterPlayerScripts.Client.UI.Tray` — tray rendering and drag/merge gesture.
 - `game.StarterPlayer.StarterPlayerScripts.Client.UI.HUD` — stats, local Calories prediction, milestone progress.
@@ -594,13 +618,17 @@ The server runs `Balance.validate()` on boot. It checks bag ordering/value, merg
 - rebirth reset/preservation behavior;
 - daily streak and wrapping;
 - pending bags;
+- starting `300` Calories and bounded `FillTray` work/reporting;
+- exact hostile action shapes including extra args, fractions, NaN, infinity, legacy `Eat`, and non-Studio debug;
+- meal early completion, success, replay, and stale ownership;
+- discovery award, migration sanitization, and New Diet preservation;
 - balance validation.
 
 Run it through MCP in Edit mode. It clones Shared to avoid ModuleScript cache staleness. Clean up `ServerStorage.__TestSandbox` after the run if it remains.
 
 ### Pacing simulator
 
-`ServerStorage.PacingSim` drives the shipped `Shared.Economy` rules and models a finite action budget, fill-tray purchasing, per-group merges, Auto-Merge, and the real multi-click bite cost. It supports policies such as richest/cheapest bag selection, keep fraction, actions per second, and smart/none upgrade behavior.
+`ServerStorage.PacingSim` drives the shipped `Shared.Economy` rules and models a finite action budget, bounded fill-tray purchasing, per-group merges, Auto-Merge, and deterministic hold duration (`eatBites / 4`) rather than fictional bite-button presses.
 
 Use a fresh clone after changing config or economy code because Studio memoizes ModuleScripts. The documented engaged baseline policy is:
 
@@ -615,7 +643,7 @@ Do not claim pacing numbers from comments as current measurements; run the simul
 Use Play mode through MCP for client/server behavior, then inspect console output. Relevant cases include:
 
 - fresh join with Studio memory fallback;
-- buy, fill, manual pair/full merge, Auto-Merge, plate, bites, and Eat;
+- buy, fill, manual pair/full merge, Auto-Merge, BeginEat, timed hold, CompleteEat, cancel, replay, and stale ownership;
 - full and empty trays;
 - milestone and body-size transitions;
 - respawn at a non-default size;
@@ -626,6 +654,15 @@ Use Play mode through MCP for client/server behavior, then inspect console outpu
 - malformed/replayed actions and rate limiting;
 - missing `Restaurant`, `Stations`, `Booth`, `Tray`, or `DropZone` behavior where relevant.
 
+Latest observed Play verification on 2026-08-20:
+
+- server boot reached `[McFatty] server ready`, which includes a successful `Balance.validate()`;
+- additive migration created `DriveThruArea.Diet1Gate`, `ScaleDial.ScaleDisplay`, and `SizeLeaderboard`;
+- a real Fill action filled the tray and advanced tutorial Step 1 only after the authoritative snapshot;
+- drag-to-table began a five-bite meal, a timed hold completed it, weight changed from `60` to `62.75 kg`, and the plate cleared after sync;
+- the collection revealed Small Fries, the scale displayed live kg, and leaderboard Row 1 updated;
+- no project runtime error/warning remained; the expected Studio DataStore API-off fallback warning and a Roblox Assistant-plugin version warning were present.
+
 ## Known architectural constraints and change-sensitive couplings
 
 - Studio is currently the only implementation source. Local Luau edits do not affect the game.
@@ -633,12 +670,13 @@ Use Play mode through MCP for client/server behavior, then inspect console outpu
 - The room size/counter reference is mirrored between `MapBuilder` and `Config.Stations` because the client cannot require ServerStorage.
 - `Progression.SizeStages`, `CharacterService.SCALE`, and `CharacterService.GIRTH` must have identical lengths.
 - Food ratios, bag prices, digestion share, bite counts, and action assumptions jointly determine pacing; change them as a system and re-run the simulator.
-- Player actions use tray indices for merge but tier identity for Eat. Changing that distinction risks eating the wrong item after indices shift.
+- Player actions use tray indices for merge but tier identity for `BeginEat`. The reservation must still own that tier at completion.
 - Bulk and Auto-Merge intentionally ignore pairs even though manual pair merging is allowed.
-- `TableFood` plating is client-only until the final bite. Moving partial meals server-side would change persistence, networking, and disconnect behavior.
+- Meal reservation/timing is server-owned while bite visuals are client-only. Food is not removed until timely completion; changing this handshake affects networking, replay safety, disconnects, and tutorial confirmation.
 - UI drag hit-testing relies on viewport-space coordinates and unscaled overlay ScreenGuis. Mixing them with inset-inclusive mouse coordinates breaks drops.
 - The game is designed for StreamingEnabled; world-facing client modules must tolerate important instances being absent or late.
 - `MapBuilder.build()` and `StationsBuilder.build()` destroy/recreate their named world roots. Inspect and confirm the exact target before running them.
+- `ensureTodoWorld()` and `ensureTodoStations()` are additive boot migrations and must remain idempotent; do not turn them into hidden destructive rebuilds.
 - Character appearance loading can reset scale values, so size is reapplied after `CharacterAppearanceLoaded`.
 - Uploaded catalog media is intentionally avoided in current sound/particle code to reduce asset moderation/deletion failures.
 
