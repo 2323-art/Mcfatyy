@@ -105,15 +105,17 @@ button press.** Asserted in both directions by `Balance.validate()`.
 
 | Bag | Cost | Drops | Unlock | EV Cal/s |
 |---|---:|---|---:|---:|
-| Snack Bag | 100 | T1-T3 (70/25/5) | 0 kg | 1.2 |
-| Big Bag | 870 | T2-T5 (55/30/12/3) | 110 kg | 2.5 |
-| Mega Bag | 11,250 | T4-T7 (45/30/18/7) | 300 kg | 7.9 |
-| Feast Bag | 165,000 | T6-T10 (40/28/18/10/4) | 1,000 kg | 25.7 |
-| Banquet Bag | 1,440,000 | T8-T11 (40/30/20/10) | 3,500 kg | 62.9 |
-| Monstrosity Bag | 10,000,000 | T9-T12 (35/30/25/10) | 6,000 kg | 108.5 |
+| Snack Bag | 80 | T1-T3 (70/25/5) | 0 kg | 1.2 |
+| Big Bag | 350 | T2-T5 (55/30/12/3) | 110 kg | 2.5 |
+| Mega Bag | 3,100 | T4-T7 (35/30/22/13) | 300 kg | 9.1 |
+| Feast Bag | 26,000 | T6-T10 (30/28/20/14/8) | 1,000 kg | 30.9 |
+| Banquet Bag | 160,000 | T8-T11 (30/30/24/16) | 3,500 kg | 72.2 |
+| Monstrosity Bag | 890,000 | T9-T12 (15/28/32/25) | 6,000 kg | 143.2 |
 
-Each rung is ~3x worse per Calorie but 2-6x better per slot. Every bag has a **0.1% jackpot**
-pulling one tier above its cap. Unlocks test against `peakKg`, so they survive New Diet.
+Each rung is ~2.2-2.8x worse per Calorie but ~2-3.7x better per slot (re-anchored in the Aug 2026
+rebalance; the old ~4x per-Calorie falloff made upgrading almost never worth it). Every bag has a
+**0.1% jackpot** pulling one tier above its cap. Unlocks test against `peakKg`, so they survive
+New Diet.
 
 **Ladder density is load-bearing.** Because merging costs MERGE_COST (1.5) items per output,
 fielding a tier-n item takes `1.5^(n-1)` tier-1 items. A player stuck on the cheapest bag needs
@@ -126,7 +128,8 @@ MERGE_COST fell 2 -> 1.5 and every price above Snack Bag was suddenly 2-12x too 
 it delivered: the top of the ladder became worthless and the simulated engaged run went 48:48 ->
 81:30. `Balance.validate()` did **not** catch it — it only compares bags to each other, and they
 were all wrong by a smooth curve. The costs above are the original hand-tuned numbers scaled by
-`(1.5/2)^(expectedTier - 1.35)`.
+`(1.5/2)^(expectedTier - 1.35)`, then re-anchored in the Aug 2026 rebalance (per-Calorie falloff
+~4x -> ~2.2-2.8x per rung) because the smooth curve had drifted too steep again.
 
 ## 6. Tray
 - Start **6 slots**, grow to **~16** via weight milestones.
